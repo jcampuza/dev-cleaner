@@ -1,0 +1,24 @@
+{
+  "name": "dev-cleaner",
+  "type": "module",
+  "version": "0.0.1",
+  "bin": {
+    "dev-cleaner": "./bin/dev-cleaner"
+  },
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "test": "bun test",
+    "build": "bun build --target=bun --production --outdir=dist ./src/index.ts",
+    "install-cli": "bun run build && chmod +x ./dist/index.js && bun link --global"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "files": [
+    "dist",
+    "package.json"
+  ]
+}

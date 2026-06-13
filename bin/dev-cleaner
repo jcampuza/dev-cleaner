@@ -1,0 +1,10 @@
+#!/usr/bin/env bun
+
+import { $ } from "bun";
+
+// Run the Bun-bundled executable from the dist directory.
+// Buns bundled output expects that the server is run from the cwd
+const distDir = `${import.meta.dir}/../dist`;
+const args = process.argv.slice(2);
+
+await $`bun ${distDir}/index.js ${args}`.cwd(distDir);
