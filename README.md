@@ -2,7 +2,7 @@
 
 Dev Cleaner is a Bun-first, Bun-only-ish tool for running machine disk cleanup of common development files and caches on macOS. It keeps the focused Xcode-oriented workflow from DevCleaner, then adds targeted Android, Flutter, Node, CocoaPods, Gradle, and editor cache surfaces.
 
-The app runs a local HTTP server and serves a Bun-bundled web UI from `src/client/index.html`. No frontend framework, Vite server, or external runtime dependency is required.
+The app runs a local HTTP server and serves a small Preact UI from `src/client/index.html`. Bun handles the HTML import, TypeScript/JSX transformation, CSS, and production bundle directly; no Vite server is required.
 
 ## Install
 
@@ -26,7 +26,7 @@ dev-cleaner
 
 The server binds to `127.0.0.1:3421` by default and opens the browser automatically.
 
-Use the npkill-style full scan flag to start from the user's home folder explicitly:
+The `-f` / `--full` flag is accepted as an npkill-style alias. In the current implementation it has the same scan scope as the default command: project discovery starts from your home folder.
 
 ```bash
 dev-cleaner --full
@@ -45,12 +45,18 @@ bun run dev
 
 ## Scan Scope
 
-By default, Dev Cleaner scans from your home folder. `-f` / `--full` makes that choice explicit. Known macOS cache locations are checked directly, and project artifacts are discovered by walking the home folder for known target names.
+By default, Dev Cleaner scans from your home folder. `-f` / `--full` currently makes that same choice explicit; it does not widen an otherwise narrower default scan. Known macOS cache locations are checked directly, and project artifacts are discovered by walking the configured roots for known target names.
 
-For one-off testing or a narrower run, set scan roots with:
+For a faster run, especially on a large home directory, restrict project discovery to the folders where you keep source code. Directly known macOS cache locations are still checked under your home directory:
 
 ```bash
-DEV_CLEANER_SCAN_ROOTS="$HOME/Developer:$HOME/Projects" bun run start
+DEV_CLEANER_SCAN_ROOTS="$HOME/Developer:$HOME/Projects" bun run dev
+```
+
+With the globally linked CLI, use:
+
+```bash
+DEV_CLEANER_SCAN_ROOTS="$HOME/Developer:$HOME/Projects" dev-cleaner
 ```
 
 ## Build
@@ -65,8 +71,10 @@ The generated output in `dist/` contains the server and UI bundle.
 ## Test
 
 ```bash
-bun run test
+bun run check
 ```
+
+`bun run check` runs the TypeScript typecheck followed by the test suite. Use `bun run test` when you only need the tests.
 
 ## Current Cleanup Areas
 
@@ -78,7 +86,7 @@ bun run test
 - Apple Tooling: CocoaPods caches, specs repos, project `Pods`.
 - Editors: VS Code and JetBrains caches.
 
-High-risk items, lockfiles, archives, simulator device data, and dependency folders are visible but not selected by default.
+High-risk items, archives, simulator device data, and dependency folders are visible but not selected by default.
 
 ## Attribution
 

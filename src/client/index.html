@@ -7,74 +7,7 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <main class="app">
-      <section class="topbar">
-        <div class="brand">
-          <div class="mark">⌁</div>
-          <div>
-            <h1>Dev Cleaner</h1>
-            <div class="subline" id="status">Idle</div>
-          </div>
-        </div>
-        <div class="actions">
-          <button id="scan" class="primary">Scan</button>
-          <button id="clear-selection" title="Unselect all items" disabled>Clear All</button>
-          <button id="delete" class="danger" disabled>Delete Selected</button>
-        </div>
-      </section>
-
-      <section class="stats">
-        <div class="stat"><span>Found</span><strong id="total-size">0 B</strong></div>
-        <div class="stat"><span>Selected</span><strong id="selected-size">0 B</strong></div>
-        <div class="stat"><span>Items</span><strong id="item-count">0</strong></div>
-        <div class="stat"><span>Duration</span><strong id="duration">0 ms</strong></div>
-      </section>
-
-      <section class="workspace">
-        <aside class="side">
-          <div class="side-head">
-            <strong>Scan Scope</strong>
-            <span class="badge">home</span>
-          </div>
-          <div class="scope">
-            <div id="scope-root">~</div>
-            <small>Known macOS dev caches plus project artifacts found under your home folder.</small>
-          </div>
-          <div class="side-head">
-            <strong>Search</strong>
-            <button id="clear-filters" class="text-btn" title="Clear filters">Clear</button>
-          </div>
-          <div class="search-box">
-            <input id="text-search" type="search" placeholder="Search paths, names, reasons" autocomplete="off" />
-          </div>
-          <div class="side-head">
-            <strong>Risk Levels</strong>
-            <span class="badge">defaults</span>
-          </div>
-          <div class="risk-guide">
-            <button class="risk-filter" data-risk-filter="low"><span class="badge low">low</span><small>Disposable caches and reports. Usually preselected.</small></button>
-            <button class="risk-filter" data-risk-filter="medium"><span class="badge medium">medium</span><small>Regeneratable, but review active project impact.</small></button>
-            <button class="risk-filter" data-risk-filter="high"><span class="badge high">high</span><small>Dependencies, archives, simulator state, or lock-like files. Opt-in only.</small></button>
-          </div>
-          <div class="side-head">
-            <strong>Areas</strong>
-            <span class="badge" id="category-count">0</span>
-          </div>
-          <div class="category-nav" id="category-nav"></div>
-        </aside>
-
-        <section class="main">
-          <div class="main-head">
-            <strong>Cleanable Files</strong>
-            <span class="badge" id="filtered-count">No scan</span>
-            <span class="badge" id="scan-id">No scan</span>
-          </div>
-          <div id="results" class="empty">No scan results</div>
-        </section>
-      </section>
-    </main>
-
-    <div id="toast" class="toast"></div>
-    <script type="module" src="./app.ts"></script>
+    <div id="root"></div>
+    <script type="module" src="./app.tsx"></script>
   </body>
 </html>

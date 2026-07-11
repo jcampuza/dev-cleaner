@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
-import type { Dirent } from "node:fs";
+import type { Dirent, Stats } from "node:fs";
 import { access, lstat, mkdtemp, realpath, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import type { CleanCategory, CleanItem, DeleteResult, ItemRisk, ProgressEvent, ScanResult } from "./types";
 
@@ -25,12 +25,24 @@ interface AddItemInput {
   tags?: string[];
 }
 
+interface ProjectScanIndex {
+  markerRoots: Map<string, Set<string>>;
+  targetPaths: Map<string, Set<string>>;
+}
+
+interface IoLimiter {
+  run<T>(task: () => Promise<T>): Promise<T>;
+}
+
 export interface ScanOptions {
   home?: string;
   cwd?: string;
   projectRoots?: string[];
   maxProjectDepth?: number;
   maxProjectEntries?: number;
+  projectIndexConcurrency?: number;
+  sizeConcurrency?: number;
+  scanId?: string;
   onProgress?: ProgressSink;
 }
 
@@ -82,6 +94,16 @@ const CATEGORIES: CategoryDef[] = [
 const CATEGORY_BY_ID = new Map(CATEGORIES.map((category) => [category.id, category]));
 const DEFAULT_MAX_PROJECT_DEPTH = 12;
 const DEFAULT_MAX_PROJECT_ENTRIES = 250_000;
+const DEFAULT_SIZE_CONCURRENCY = 32;
+const DEFAULT_PROJECT_INDEX_CONCURRENCY = 8;
+const PROJECT_MARKERS = [
+  "settings.gradle",
+  "settings.gradle.kts",
+  "build.gradle",
+  "build.gradle.kts",
+  "pubspec.yaml",
+  "Podfile",
+] as const;
 const NODE_TARGETS = [
   "node_modules",
   "bower_components",
@@ -126,23 +148,27 @@ const NODE_TARGETS = [
 
 export async function scanCleanableItems(options: ScanOptions = {}): Promise<ScanResult> {
   const started = Date.now();
+  const scanId = options.scanId ?? crypto.randomUUID();
   const home = resolve(options.home ?? process.env.HOME ?? "");
-  const projectRoots = sanitizeProjectRoots(options.projectRoots ?? getEnvProjectRoots() ?? [home], home);
+  const projectRoots = sanitizeProjectRoots(options.projectRoots ?? getEnvProjectRoots() ?? [home], home, options.projectRoots === undefined);
   const onProgress = options.onProgress ?? (() => undefined);
   const seen = new Set<string>();
   const items: CleanItem[] = [];
+  const sizeLimiter = createLimiter(options.sizeConcurrency ?? DEFAULT_SIZE_CONCURRENCY);
 
-  onProgress({ type: "scan-start", message: "Scan started", payload: { home, projectRoots } });
+  const emit = (event: ProgressEvent) => onProgress({ ...event, sessionId: scanId });
+  emit({ type: "scan-start", message: "Scan started", payload: { home, projectRoots, startedAt: new Date(started).toISOString() } });
+  const projectIndex = scanProjectIndex(projectRoots, PROJECT_MARKERS, NODE_TARGETS, options, emit);
 
   const add = async (input: AddItemInput) => {
-    const item = await createItem(input, seen);
+    const item = await createItem(input, seen, sizeLimiter);
     if (!item) return;
     items.push(item);
-    onProgress({ type: "scan-item", message: item.label, payload: { id: item.id, size: item.size } });
+    emit({ type: "scan-item", message: item.label, payload: { item, id: item.id, size: item.size } });
   };
 
   for (const category of CATEGORIES) {
-    onProgress({ type: "scan-category", message: category.name, payload: { categoryId: category.id } });
+    emit({ type: "scan-category", message: category.name, payload: { categoryId: category.id, category } });
     switch (category.id) {
       case "xcode":
         await scanXcode(home, category, add);
@@ -151,16 +177,16 @@ export async function scanCleanableItems(options: ScanOptions = {}): Promise<Sca
         await scanSimulators(home, category, add);
         break;
       case "android":
-        await scanAndroid(home, projectRoots, category, add, options);
+        await scanAndroid(home, projectIndex, category, add);
         break;
       case "flutter":
-        await scanFlutter(home, projectRoots, category, add, options);
+        await scanFlutter(home, projectIndex, category, add);
         break;
       case "node":
-        await scanNode(home, projectRoots, category, add, options);
+        await scanNode(home, projectIndex, category, add);
         break;
       case "apple":
-        await scanAppleTooling(home, projectRoots, category, add, options);
+        await scanAppleTooling(home, projectIndex, category, add);
         break;
       case "ide":
         await scanIde(home, category, add);
@@ -168,7 +194,8 @@ export async function scanCleanableItems(options: ScanOptions = {}): Promise<Sca
     }
   }
 
-  const categories = CATEGORIES.map((category) => buildCategory(category, items))
+  const canonicalItems = canonicalizeItems(items);
+  const categories = CATEGORIES.map((category) => buildCategory(category, canonicalItems))
     .filter((category) => category.items.length > 0);
   const totalSize = sum(categories.map((category) => category.totalSize));
   const selectedSize = sum(categories.map((category) => category.selectedSize));
@@ -179,7 +206,7 @@ export async function scanCleanableItems(options: ScanOptions = {}): Promise<Sca
 
   const result: ScanResult = {
     summary: {
-      id: crypto.randomUUID(),
+      id: scanId,
       startedAt: new Date(started).toISOString(),
       finishedAt: new Date(finished).toISOString(),
       durationMs: finished - started,
@@ -187,13 +214,13 @@ export async function scanCleanableItems(options: ScanOptions = {}): Promise<Sca
       projectRoots,
       totalSize,
       selectedSize,
-      itemCount: items.length,
+      itemCount: canonicalItems.length,
       selectedCount,
     },
     categories,
   };
 
-  onProgress({ type: "scan-complete", message: "Scan complete", payload: result.summary });
+  emit({ type: "scan-complete", message: "Scan complete", payload: result.summary });
   return result;
 }
 
@@ -205,19 +232,37 @@ export async function deleteCleanItems(result: ScanResult, ids: string[], onProg
 
   onProgress({ type: "delete-start", message: "Delete started", payload: { count: uniqueIds.length } });
 
+  const requestedItems: CleanItem[] = [];
   for (const id of uniqueIds) {
     const item = itemById.get(id);
     if (!item) {
       failed.push({ id, path: "", error: "Item is not part of the latest scan." });
       continue;
     }
+    requestedItems.push(item);
+  }
+
+  const deletionGroups = groupOverlappingItems(requestedItems);
+  for (const { item, covered } of deletionGroups) {
+    try {
+      await lstat(item.path);
+    } catch {
+      failed.push({ id: item.id, path: item.path, error: "Item no longer exists." });
+      for (const child of covered) failed.push({ id: child.id, path: child.path, error: "Item no longer exists." });
+      continue;
+    }
 
     try {
-      await rm(item.path, { recursive: item.kind !== "file", force: true, maxRetries: 2 });
+      await rm(item.path, { recursive: item.kind !== "file", force: false, maxRetries: 2 });
       deleted.push({ id: item.id, path: item.path, size: item.size });
       onProgress({ type: "delete-item", message: item.label, payload: { id: item.id, size: item.size } });
+      for (const child of covered) {
+        deleted.push({ id: child.id, path: child.path, size: 0 });
+        onProgress({ type: "delete-item", message: child.label, payload: { id: child.id, size: 0, coveredBy: item.id } });
+      }
     } catch (error) {
       failed.push({ id: item.id, path: item.path, error: errorMessage(error) });
+      for (const child of covered) failed.push({ id: child.id, path: child.path, error: `Covered parent could not be deleted: ${errorMessage(error)}` });
     }
   }
 
@@ -225,6 +270,29 @@ export async function deleteCleanItems(result: ScanResult, ids: string[], onProg
   onProgress({ type: "delete-complete", message: "Delete complete", payload: { freedBytes, failed: failed.length } });
 
   return { deleted, failed, freedBytes };
+}
+
+function canonicalizeItems(items: CleanItem[]): CleanItem[] {
+  return groupOverlappingItems(items).map((group) => group.item);
+}
+
+function groupOverlappingItems(items: CleanItem[]): Array<{ item: CleanItem; covered: CleanItem[] }> {
+  const groups: Array<{ item: CleanItem; covered: CleanItem[] }> = [];
+  const ordered = [...items].sort((a, b) => a.path.length - b.path.length || a.path.localeCompare(b.path));
+  for (const item of ordered) {
+    const parent = groups.find((group) => (
+      group.item.path === item.path
+      || (group.item.kind === "directory" && isDescendantPath(group.item.path, item.path))
+    ));
+    if (parent) parent.covered.push(item);
+    else groups.push({ item, covered: [] });
+  }
+  return groups;
+}
+
+function isDescendantPath(parent: string, candidate: string): boolean {
+  const child = relative(parent, candidate);
+  return child !== "" && child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child);
 }
 
 export function formatBytes(bytes: number): string {
@@ -352,10 +420,9 @@ async function scanSimulators(home: string, category: CategoryDef, add: (input: 
 
 async function scanAndroid(
   home: string,
-  projectRoots: string[],
+  projectIndex: Promise<ProjectScanIndex>,
   category: CategoryDef,
   add: (input: AddItemInput) => Promise<void>,
-  options: ScanOptions,
 ) {
   for (const target of [
     ["Gradle Caches", join(home, ".gradle/caches"), "low", true, "Global Gradle dependency and transform caches."],
@@ -416,7 +483,7 @@ async function scanAndroid(
     }
   }
 
-  const roots = await findProjectRoots(projectRoots, ["settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"], options);
+  const roots = rootsWithMarkers(await projectIndex, ["settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"]);
   for (const root of roots) {
     for (const relative of [".gradle", "build", "app/build"]) {
       await add({
@@ -435,10 +502,9 @@ async function scanAndroid(
 
 async function scanFlutter(
   home: string,
-  projectRoots: string[],
+  projectIndex: Promise<ProjectScanIndex>,
   category: CategoryDef,
   add: (input: AddItemInput) => Promise<void>,
-  options: ScanOptions,
 ) {
   for (const target of [
     ["Pub Cache", join(home, ".pub-cache"), "medium", false, "Global Dart and Flutter package cache."],
@@ -455,15 +521,13 @@ async function scanFlutter(
     });
   }
 
-  const roots = await findProjectRoots(projectRoots, ["pubspec.yaml"], options);
+  const roots = rootsWithMarkers(await projectIndex, ["pubspec.yaml"]);
   for (const root of roots) {
     for (const target of [
       ["build", "low", true, "Flutter build output."],
       [".dart_tool", "low", true, "Dart tool cache."],
       [".packages", "medium", false, "Legacy generated package map."],
-      ["pubspec.lock", "high", false, "Lockfile can be intentional source state."],
       [".fvm", "medium", false, "Project-local FVM SDK cache and config."],
-      [".fvmrc", "high", false, "FVM version pin file."],
       ["android/.gradle", "low", true, "Flutter Android Gradle cache."],
       ["android/build", "low", true, "Flutter Android build output."],
       ["android/app/build", "low", true, "Flutter Android app build output."],
@@ -471,7 +535,6 @@ async function scanFlutter(
       ["ios/Flutter/Flutter.framework", "low", true, "Generated Flutter iOS framework."],
       ["ios/Flutter/Flutter.podspec", "low", true, "Generated Flutter iOS podspec."],
       ["ios/Pods", "medium", false, "Project CocoaPods dependencies."],
-      ["ios/Podfile.lock", "high", false, "CocoaPods lockfile."],
     ] as const) {
       await add({
         category,
@@ -489,11 +552,11 @@ async function scanFlutter(
 
 async function scanNode(
   home: string,
-  projectRoots: string[],
+  projectIndex: Promise<ProjectScanIndex>,
   category: CategoryDef,
   add: (input: AddItemInput) => Promise<void>,
-  options: ScanOptions,
 ) {
+  const metadataCache = new Map<string, Promise<string>>();
   for (const target of [
     ["npm Cache", join(home, ".npm/_cacache"), "low", true, "npm package tarball cache."],
     ["Bun Install Cache", join(home, ".bun/install/cache"), "low", true, "Bun package cache."],
@@ -512,11 +575,17 @@ async function scanNode(
     });
   }
 
-  const targetPaths = await findTargetPaths(projectRoots, NODE_TARGETS, options);
+  const targetPaths = pathsForTargets(await projectIndex, NODE_TARGETS);
   for (const targetPath of targetPaths) {
     const target = basename(targetPath);
     const parent = dirname(targetPath);
-    const metadata = await targetMetadata(targetPath, home);
+    const metadataKey = dirname(targetPath) === home ? targetPath : dirname(targetPath);
+    let metadataPromise = metadataCache.get(metadataKey);
+    if (!metadataPromise) {
+      metadataPromise = targetMetadata(targetPath, home);
+      metadataCache.set(metadataKey, metadataPromise);
+    }
+    const metadata = await metadataPromise;
     const profile = nodeTargetProfile(target, targetPath, home);
     await add({
       category,
@@ -534,7 +603,7 @@ async function scanNode(
 function nodeTargetProfile(target: string, targetPath: string, home: string): { risk: ItemRisk; selectedByDefault: boolean; reason: string } {
   if (target === "node_modules") {
     return {
-      risk: "high",
+      risk: "medium",
       selectedByDefault: false,
       reason: "Project dependencies can be reinstalled, but deleting them disrupts active work.",
     };
@@ -583,10 +652,9 @@ async function targetMetadata(targetPath: string, home: string): Promise<string>
 
 async function scanAppleTooling(
   home: string,
-  projectRoots: string[],
+  projectIndex: Promise<ProjectScanIndex>,
   category: CategoryDef,
   add: (input: AddItemInput) => Promise<void>,
-  options: ScanOptions,
 ) {
   for (const target of [
     ["CocoaPods Specs Repo", join(home, ".cocoapods/repos"), "medium", false, "Global CocoaPods specs repositories."],
@@ -603,11 +671,10 @@ async function scanAppleTooling(
     });
   }
 
-  const roots = await findProjectRoots(projectRoots, ["Podfile"], options);
+  const roots = rootsWithMarkers(await projectIndex, ["Podfile"]);
   for (const root of roots) {
     for (const target of [
       ["Pods", "medium", false, "Project CocoaPods dependencies."],
-      ["Podfile.lock", "high", false, "CocoaPods lockfile."],
     ] as const) {
       await add({
         category,
@@ -699,7 +766,7 @@ async function addChildren(input: {
   }
 }
 
-async function createItem(input: AddItemInput, seen: Set<string>): Promise<CleanItem | undefined> {
+async function createItem(input: AddItemInput, seen: Set<string>, sizeLimiter: IoLimiter): Promise<CleanItem | undefined> {
   const path = resolve(input.path);
   let itemStat;
   try {
@@ -712,7 +779,7 @@ async function createItem(input: AddItemInput, seen: Set<string>): Promise<Clean
   if (seen.has(key)) return undefined;
   seen.add(key);
 
-  const size = await pathSize(path);
+  const size = await pathSize(path, itemStat, sizeLimiter);
   if (size <= 0) return undefined;
 
   return {
@@ -731,45 +798,67 @@ async function createItem(input: AddItemInput, seen: Set<string>): Promise<Clean
   };
 }
 
-async function pathSize(path: string): Promise<number> {
+async function pathSize(path: string, rootStat: Stats | undefined, limiter: IoLimiter): Promise<number> {
   let total = 0;
-  const stack = [path];
+  let active = 0;
+  let done = false;
+  const stack: Array<{ path: string; itemStat?: Stats }> = [{ path, itemStat: rootStat }];
 
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current) continue;
+  return await new Promise<number>((resolve) => {
+    const complete = () => {
+      if (done) return;
+      done = true;
+      resolve(total);
+    };
 
-    let currentStat;
-    try {
-      currentStat = await lstat(current);
-    } catch {
-      continue;
-    }
+    const processEntry = async (entry: { path: string; itemStat?: Stats }) => {
+      const current = entry.path;
+      let currentStat = entry.itemStat;
+      try {
+        currentStat ??= await limiter.run(() => lstat(current));
+      } catch {
+        return;
+      }
 
-    if (currentStat.isSymbolicLink()) {
+      if (currentStat.isSymbolicLink()) {
+        total += currentStat.size;
+        return;
+      }
+
+      if (!currentStat.isDirectory()) {
+        total += currentStat.size;
+        return;
+      }
+
       total += currentStat.size;
-      continue;
-    }
+      let children: string[];
+      try {
+        children = await limiter.run(() => readdir(current));
+      } catch {
+        return;
+      }
 
-    if (!currentStat.isDirectory()) {
-      total += currentStat.size;
-      continue;
-    }
+      for (const child of children) {
+        stack.push({ path: join(current, child) });
+      }
+    };
 
-    total += currentStat.size;
-    let children: string[];
-    try {
-      children = await readdir(current);
-    } catch {
-      continue;
-    }
+    const schedule = () => {
+      while (active < DEFAULT_SIZE_CONCURRENCY && stack.length > 0) {
+        const entry = stack.pop();
+        if (!entry) continue;
+        active += 1;
+        void processEntry(entry).finally(() => {
+          active -= 1;
+          schedule();
+        });
+      }
 
-    for (const child of children) {
-      stack.push(join(current, child));
-    }
-  }
+      if (active === 0 && stack.length === 0) complete();
+    };
 
-  return total;
+    schedule();
+  });
 }
 
 async function existingChildren(path: string): Promise<string[]> {
@@ -816,40 +905,69 @@ async function findNamedDirectories(root: string, name: string, maxDepth: number
   return findDirectories(root, maxDepth, maxEntries, (entryName) => entryName === name);
 }
 
-async function findTargetPaths(projectRoots: string[], targets: readonly string[], options: ScanOptions): Promise<string[]> {
-  const found = new Set<string>();
+async function scanProjectIndex(
+  projectRoots: string[],
+  markers: readonly string[],
+  targets: readonly string[],
+  options: ScanOptions,
+  onProgress: ProgressSink,
+): Promise<ProjectScanIndex> {
+  const markerSet = new Set(markers);
   const targetSet = new Set(targets);
+  const markerRoots = new Map(markers.map((marker) => [marker, new Set<string>()]));
+  const targetPaths = new Map(targets.map((target) => [target, new Set<string>()]));
   const maxDepth = options.maxProjectDepth ?? DEFAULT_MAX_PROJECT_DEPTH;
   const maxEntries = options.maxProjectEntries ?? DEFAULT_MAX_PROJECT_ENTRIES;
 
-  for (const root of projectRoots) {
-    if (!(await canRead(root))) continue;
-    if (targetSet.has(basename(root))) found.add(root);
-    await walk(root, maxDepth, maxEntries, async (current, entries) => {
-      for (const entry of entries) {
-        if (targetSet.has(entry.name)) found.add(join(current, entry.name));
-      }
-    });
-  }
+  const progress = { rootsComplete: 0, rootsTotal: projectRoots.length, entriesVisited: 0, cappedRoots: [] as string[] };
+  let lastProgressAt = 0;
+  const report = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastProgressAt < 500) return;
+    lastProgressAt = now;
+    onProgress({ type: "scan-index", message: progress.cappedRoots.length > 0 ? "Project indexing reached its safety cap" : "Indexing projects", payload: { ...progress, cappedRoots: [...progress.cappedRoots] } });
+  };
 
-  return Array.from(found).sort((a, b) => a.localeCompare(b));
+  await mapConcurrent(projectRoots, options.projectIndexConcurrency ?? DEFAULT_PROJECT_INDEX_CONCURRENCY, async (root) => {
+    if (await canRead(root)) {
+      const rootName = basename(root);
+      if (targetSet.has(rootName)) targetPaths.get(rootName)?.add(root);
+      const walkResult = await walk(root, maxDepth, maxEntries, async (current, entries) => {
+        for (const entry of entries) {
+          if (markerSet.has(entry.name)) markerRoots.get(entry.name)?.add(current);
+          if (targetSet.has(entry.name)) targetPaths.get(entry.name)?.add(join(current, entry.name));
+        }
+      }, (count) => {
+        progress.entriesVisited += count;
+        report();
+      });
+      if (walkResult.capped) progress.cappedRoots.push(root);
+    }
+    progress.rootsComplete += 1;
+    report(true);
+  });
+
+  return { markerRoots, targetPaths };
 }
 
-async function findProjectRoots(projectRoots: string[], markers: string[], options: ScanOptions): Promise<string[]> {
-  const found = new Set<string>();
-  const maxDepth = options.maxProjectDepth ?? DEFAULT_MAX_PROJECT_DEPTH;
-  const maxEntries = options.maxProjectEntries ?? DEFAULT_MAX_PROJECT_ENTRIES;
-
-  for (const root of projectRoots) {
-    if (!(await canRead(root))) continue;
-    await walk(root, maxDepth, maxEntries, async (current, entries) => {
-      if (entries.some((entry) => markers.includes(entry.name))) {
-        found.add(current);
-      }
-    });
+function rootsWithMarkers(index: ProjectScanIndex, markers: readonly string[]): string[] {
+  const roots = new Set<string>();
+  for (const marker of markers) {
+    for (const root of index.markerRoots.get(marker) ?? []) {
+      roots.add(root);
+    }
   }
+  return Array.from(roots).sort((a, b) => a.localeCompare(b));
+}
 
-  return Array.from(found).sort((a, b) => a.localeCompare(b));
+function pathsForTargets(index: ProjectScanIndex, targets: readonly string[]): string[] {
+  const paths = new Set<string>();
+  for (const target of targets) {
+    for (const path of index.targetPaths.get(target) ?? []) {
+      paths.add(path);
+    }
+  }
+  return Array.from(paths).sort((a, b) => a.localeCompare(b));
 }
 
 async function findDirectories(root: string, maxDepth: number, maxEntries: number, predicate: (name: string) => boolean): Promise<string[]> {
@@ -867,7 +985,8 @@ async function walk(
   maxDepth: number,
   maxEntries: number,
   visit: (current: string, entries: Dirent<string>[]) => Promise<void>,
-) {
+  onVisited?: (count: number) => void,
+): Promise<{ visited: number; capped: boolean }> {
   let visited = 0;
   const stack = [{ path: root, depth: 0 }];
   const skip = new Set([
@@ -915,6 +1034,7 @@ async function walk(
     const current = stack.pop();
     if (!current || current.depth > maxDepth) continue;
     visited += 1;
+    onVisited?.(1);
 
     let entries: Dirent<string>[];
     try {
@@ -930,6 +1050,38 @@ async function walk(
       stack.push({ path: join(current.path, entry.name), depth: current.depth + 1 });
     }
   }
+  return { visited, capped: visited >= maxEntries && stack.length > 0 };
+}
+
+function createLimiter(concurrency: number): IoLimiter {
+  const limit = Math.max(1, Math.floor(concurrency));
+  let active = 0;
+  const queue: Array<() => void> = [];
+  const next = () => {
+    while (active < limit && queue.length > 0) {
+      active += 1;
+      queue.shift()?.();
+    }
+  };
+  return {
+    run<T>(task: () => Promise<T>): Promise<T> {
+      return new Promise<T>((resolve, reject) => {
+        queue.push(() => void task().then(resolve, reject).finally(() => { active -= 1; next(); }));
+        next();
+      });
+    },
+  };
+}
+
+async function mapConcurrent<T>(values: readonly T[], concurrency: number, task: (value: T) => Promise<void>): Promise<void> {
+  const queue = [...values];
+  const workers = Array.from({ length: Math.min(Math.max(1, Math.floor(concurrency)), queue.length) }, async () => {
+    while (queue.length > 0) {
+      const value = queue.shift();
+      if (value !== undefined) await task(value);
+    }
+  });
+  await Promise.all(workers);
 }
 
 function buildCategory(category: CategoryDef, allItems: CleanItem[]): CleanCategory {
@@ -944,12 +1096,12 @@ function buildCategory(category: CategoryDef, allItems: CleanItem[]): CleanCateg
   };
 }
 
-function sanitizeProjectRoots(roots: string[], home: string): string[] {
+function sanitizeProjectRoots(roots: string[], home: string, useFallback: boolean): string[] {
   const fallback = [process.cwd()];
   const normalized = roots
     .map((root) => resolve(expandHome(root, home)))
     .filter(Boolean);
-  return Array.from(new Set(normalized.length > 0 ? normalized : fallback));
+  return Array.from(new Set(normalized.length > 0 || !useFallback ? normalized : fallback));
 }
 
 function getEnvProjectRoots(): string[] | undefined {

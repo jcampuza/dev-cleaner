@@ -8,6 +8,8 @@
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "check": "bun run typecheck && bun test",
     "build": "bun build --target=bun --production --outdir=dist ./src/index.ts",
     "install-cli": "bun run build && chmod +x ./dist/index.js && bun link --global"
   },
@@ -20,5 +22,8 @@
   "files": [
     "dist",
     "package.json"
-  ]
+  ],
+  "dependencies": {
+    "preact": "^10.29.7"
+  }
 }

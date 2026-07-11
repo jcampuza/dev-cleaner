@@ -2,18 +2,26 @@ import { $ } from "bun";
 import { parseArgs } from "node:util";
 import { deleteCleanItems, scanCleanableItems } from "./cleaner";
 import appHtml from "./client/index.html";
-import type { ProgressEvent, ScanResult, ScanStatus } from "./types";
+import type { CleanCategory, CleanItem, PartialScanResult, ProgressEvent, ScanResult, ScanStatus, ServerOperation } from "./types";
 
 interface ServerState {
   status: ScanStatus;
   scan: ScanResult | null;
   projectRoots: string[];
+  partialScan: PartialScanResult | null;
+  activeOperation: ServerOperation | null;
+  operationId: string | null;
   clients: Set<ReadableStreamDefaultController<Uint8Array>>;
 }
 
 interface CliOptions {
   full: boolean;
   noOpen: boolean;
+}
+
+interface ServerDependencies {
+  scan: typeof scanCleanableItems;
+  delete: typeof deleteCleanItems;
 }
 
 const encoder = new TextEncoder();
@@ -23,11 +31,14 @@ export function createServerState(): ServerState {
     status: "idle",
     scan: null,
     projectRoots: getInitialProjectRoots(),
+    partialScan: null,
+    activeOperation: null,
+    operationId: null,
     clients: new Set(),
   };
 }
 
-export function createServerOptions(state = createServerState()) {
+export function createServerOptions(state = createServerState(), dependencies: ServerDependencies = { scan: scanCleanableItems, delete: deleteCleanItems }) {
   return {
     routes: {
       "/": appHtml,
@@ -41,10 +52,10 @@ export function createServerOptions(state = createServerState()) {
         GET: withRouteErrors(state, (request, server) => eventStream(state, request, server)),
       },
       "/api/scan": {
-        POST: withRouteErrors(state, (request) => scan(state, request)),
+        POST: withRouteErrors(state, (request) => scan(state, request, dependencies)),
       },
       "/api/delete": {
-        POST: withRouteErrors(state, (request) => deleteItems(state, request)),
+        POST: withRouteErrors(state, (request) => deleteItems(state, request, dependencies)),
       },
     },
     fetch() {
@@ -93,42 +104,128 @@ async function readJson<T>(request: Request): Promise<T> {
   return await request.json() as T;
 }
 
+function validateMutationRequest(request: Request): Response | undefined {
+  const origin = request.headers.get("origin");
+  if (origin && origin !== new URL(request.url).origin) {
+    return json({ error: "Cross-origin requests are not allowed." }, 403);
+  }
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") {
+    return json({ error: "Content-Type must be application/json." }, 415);
+  }
+}
+
 function stateResponse(state: ServerState): Response {
   return json({
     status: state.status,
     scan: state.scan,
+    partialScan: state.partialScan,
     projectRoots: state.projectRoots,
+    activeOperation: state.activeOperation,
+    operationId: state.operationId,
   });
 }
 
-async function scan(state: ServerState, request: Request): Promise<Response> {
-  if (state.status === "scanning") {
-    return json({ error: "A scan is already running." }, 409);
-  }
+async function scan(state: ServerState, request: Request, dependencies: ServerDependencies): Promise<Response> {
+  const invalid = validateMutationRequest(request);
+  if (invalid) return invalid;
+  if (state.activeOperation) return json({ error: `A ${state.activeOperation} operation is already running.` }, 409);
 
   const body = await readJson<{ projectRoots?: string[] }>(request);
-  const requestedRoots = normalizeRoots(body.projectRoots);
-  if (requestedRoots.length > 0) state.projectRoots = requestedRoots;
+  if (Object.hasOwn(body, "projectRoots")) state.projectRoots = normalizeRoots(body.projectRoots);
 
+  const sessionId = crypto.randomUUID();
+  state.activeOperation = "scan";
+  state.operationId = sessionId;
   state.status = "scanning";
-  state.scan = await scanCleanableItems({
-    projectRoots: state.projectRoots,
-    onProgress: (event) => broadcast(state, event),
-  });
-  state.status = "complete";
-
-  return json(state.scan);
+  state.partialScan = null;
+  try {
+    const result = await dependencies.scan({
+      projectRoots: state.projectRoots,
+      scanId: sessionId,
+      onProgress: (event) => {
+        applyProgress(state, event);
+        broadcast(state, event);
+      },
+    });
+    if (state.operationId === sessionId) {
+      state.scan = result;
+      state.partialScan = null;
+      state.status = "complete";
+    }
+    return json(result);
+  } finally {
+    if (state.operationId === sessionId) {
+      state.activeOperation = null;
+      state.operationId = null;
+    }
+  }
 }
 
-async function deleteItems(state: ServerState, request: Request): Promise<Response> {
+async function deleteItems(state: ServerState, request: Request, dependencies: ServerDependencies): Promise<Response> {
+  const invalid = validateMutationRequest(request);
+  if (invalid) return invalid;
+  if (state.activeOperation) return json({ error: `A ${state.activeOperation} operation is already running.` }, 409);
   if (!state.scan) return json({ error: "Run a scan before deleting." }, 400);
 
   const body = await readJson<{ ids?: string[] }>(request);
   const ids = Array.isArray(body.ids) ? body.ids.filter((id) => typeof id === "string") : [];
   if (ids.length === 0) return json({ error: "No item IDs were provided." }, 400);
 
-  const result = await deleteCleanItems(state.scan, ids, (event) => broadcast(state, event));
-  return json(result);
+  const operationId = crypto.randomUUID();
+  state.activeOperation = "delete";
+  state.operationId = operationId;
+  try {
+    const result = await dependencies.delete(state.scan, ids, (event) => broadcast(state, { ...event, sessionId: operationId }));
+    const deletedIds = new Set(result.deleted.map((item) => item.id));
+    state.scan = removeDeletedItems(state.scan, deletedIds);
+    return json({ ...result, scan: state.scan });
+  } finally {
+    if (state.operationId === operationId) {
+      state.activeOperation = null;
+      state.operationId = null;
+    }
+  }
+}
+
+function applyProgress(state: ServerState, event: ProgressEvent) {
+  if (!event.sessionId || event.sessionId !== state.operationId) return;
+  if (event.type === "scan-start") {
+    const payload = event.payload as { home: string; projectRoots: string[]; startedAt: string };
+    state.partialScan = { id: event.sessionId, startedAt: payload.startedAt, home: payload.home, projectRoots: payload.projectRoots, categories: [], totalSize: 0, itemCount: 0 };
+  } else if (event.type === "scan-category" && state.partialScan) {
+    const payload = event.payload as { categoryId: string; category?: Omit<CleanCategory, "items" | "totalSize" | "selectedSize"> };
+    state.partialScan.currentCategoryId = payload.categoryId;
+    if (payload.category && !state.partialScan.categories.some((entry) => entry.id === payload.categoryId)) {
+      state.partialScan.categories.push({ ...payload.category, items: [], totalSize: 0, selectedSize: 0 });
+    }
+  } else if (event.type === "scan-index" && state.partialScan) {
+    state.partialScan.index = event.payload as PartialScanResult["index"];
+  } else if (event.type === "scan-item" && state.partialScan) {
+    appendPartialItem(state.partialScan, (event.payload as { item: CleanItem }).item);
+  }
+}
+
+function appendPartialItem(partial: PartialScanResult, item: CleanItem) {
+  let category = partial.categories.find((entry) => entry.id === item.categoryId);
+  if (!category) {
+    category = { id: item.categoryId, name: item.categoryName, description: "", accent: "", items: [], totalSize: 0, selectedSize: 0 };
+    partial.categories.push(category);
+  }
+  category.items.push(item);
+  category.totalSize += item.size;
+  if (item.selectedByDefault) category.selectedSize += item.size;
+  partial.totalSize += item.size;
+  partial.itemCount += 1;
+}
+
+function removeDeletedItems(scan: ScanResult, deletedIds: Set<string>): ScanResult {
+  const categories: CleanCategory[] = scan.categories.map((category) => {
+    const items = category.items.filter((item) => !deletedIds.has(item.id));
+    return { ...category, items, totalSize: items.reduce((sum, item) => sum + item.size, 0), selectedSize: items.filter((item) => item.selectedByDefault).reduce((sum, item) => sum + item.size, 0) };
+  }).filter((category) => category.items.length > 0);
+  const items = categories.flatMap((category) => category.items);
+  return { ...scan, categories, summary: { ...scan.summary, totalSize: items.reduce((sum, item) => sum + item.size, 0), selectedSize: items.filter((item) => item.selectedByDefault).reduce((sum, item) => sum + item.size, 0), itemCount: items.length, selectedCount: items.filter((item) => item.selectedByDefault).length } };
 }
 
 function eventStream(state: ServerState, request: Request, server: Bun.Server<undefined>): Response {

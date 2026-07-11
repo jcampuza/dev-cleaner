@@ -1,6 +1,7 @@
 export type ItemRisk = "low" | "medium" | "high";
 
 export type ScanStatus = "idle" | "scanning" | "complete" | "error";
+export type ServerOperation = "scan" | "delete";
 
 export interface CleanItem {
   id: string;
@@ -45,6 +46,25 @@ export interface ScanResult {
   categories: CleanCategory[];
 }
 
+export interface PartialScanResult {
+  id: string;
+  startedAt: string;
+  home: string;
+  projectRoots: string[];
+  categories: CleanCategory[];
+  totalSize: number;
+  itemCount: number;
+  currentCategoryId?: string;
+  index?: ProjectIndexProgress;
+}
+
+export interface ProjectIndexProgress {
+  rootsComplete: number;
+  rootsTotal: number;
+  entriesVisited: number;
+  cappedRoots: string[];
+}
+
 export interface DeleteResult {
   deleted: Array<{ id: string; path: string; size: number }>;
   failed: Array<{ id: string; path: string; error: string }>;
@@ -52,7 +72,8 @@ export interface DeleteResult {
 }
 
 export interface ProgressEvent {
-  type: "scan-start" | "scan-category" | "scan-item" | "scan-complete" | "delete-start" | "delete-item" | "delete-complete" | "error";
+  type: "scan-start" | "scan-index" | "scan-category" | "scan-item" | "scan-complete" | "delete-start" | "delete-item" | "delete-complete" | "error";
   message: string;
+  sessionId?: string;
   payload?: unknown;
 }
